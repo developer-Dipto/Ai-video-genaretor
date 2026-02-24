@@ -7,7 +7,7 @@ on:
         description: 'Paste your JSON array here'
         required: true
         type: string
-        default: '{"scenes": [{"scene_n": 1, "duration": 4, "bg_prompt": "A lone warrior on a mountain peak at sunrise, cinematic lighting", "motion": "zoom-in", "transition": "fade-in"}, {"scene_n": 2, "duration": 4, "bg_prompt": "Close up of the warrior sword glowing blue", "motion": "zoom-out", "transition": "fade-out"}]}'
+        default: '{"global_settings": {"ratio": "16:9"}, "scenes": [{"scene_n": 1, "duration": 5, "bg_prompt": "A lone samurai standing on a mountain peak at sunrise", "motion": "zoom-in", "transition_file": "leftToRight.mp4", "transition_type": 1}, {"scene_n": 2, "duration": 5, "bg_prompt": "Close up of a katana sword reflecting the sun", "motion": "pan-right", "transition_file": "none", "transition_type": 1}]}'
 
 jobs:
   build_video:
@@ -27,11 +27,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Save Input JSON
+    - name: Save Input JSON Safely
+      env:
+        JSON_INPUT: ${{ github.event.inputs.json_input }}
       run: |
-        cat << 'EOF' > input.json
-        ${{ github.event.inputs.json_input }}
-        EOF
+        echo "$JSON_INPUT" > input.json
+        echo "=== Content of input.json ==="
+        cat input.json
+        echo "============================="
 
     - name: Run Video Generator Script
       run: python video_generator.py
@@ -40,4 +43,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Final-AI-Video
-        path: output.mp4
+        path: final_video.mp4
