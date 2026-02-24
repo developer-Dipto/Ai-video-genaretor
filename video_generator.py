@@ -2,98 +2,146 @@ import json
 import os
 import requests
 import numpy as np
+import random
 from PIL import Image
-from moviepy.editor import ImageClip, concatenate_videoclips, vfx
+from moviepy.editor import *
 
-# আপনার দেওয়া API কনফিগারেশন
+# API Config
 API_URL = "https://simple-ai-image-genaretor.deptoroy91.workers.dev/"
 API_KEY = "01828567716"
 
-def generate_image(prompt, scene_n):
-    print(f"Generating image for scene {scene_n}...")
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": API_KEY
-    }
-    payload = {
-        "prompt": prompt,
-        "size": "16:9",
-        "model": "@cf/black-forest-labs/flux-1-schnell"
-    }
-    
+DIMENSIONS = {
+    "16:9": (1920, 1080),
+    "9:16": (1080, 1920)
+}
+
+def generate_image(prompt, size_ratio, scene_n):
+    print(f"Generating Image for Scene {scene_n}...")
+    headers = {"Content-Type": "application/json", "x-api-key": API_KEY}
+    payload = {"prompt": prompt, "size": size_ratio, "model": "@cf/black-forest-labs/flux-1-schnell"}
     response = requests.post(API_URL, json=payload, headers=headers)
     
     if response.status_code == 200:
-        image_path = f"scene_{scene_n}.jpg"
-        with open(image_path, "wb") as f:
+        img_path = f"scene_{scene_n}.jpg"
+        with open(img_path, "wb") as f:
             f.write(response.content)
-        print(f"Image saved: {image_path}")
-        return image_path
+        return img_path
     else:
-        raise Exception(f"API Error for scene {scene_n}: {response.text}")
+        raise Exception(f"API Error: {response.text}")
 
-# MoviePy এর জন্য কাস্টম জুম-ইন ও জুম-আউট ফাংশন (যাতে কোয়ালিটি ভালো থাকে)
-def apply_motion(clip, motion):
+# Simple Universal Motion Engine
+def apply_motion(clip, motion_type):
     w, h = clip.size
-    
     def effect(get_frame, t):
         img = Image.fromarray(get_frame(t))
+        progress = t / clip.duration
+        scale = 1.15 
         
-        if motion == "zoom-in":
-            # 1.0 থেকে 1.15 পর্যন্ত স্কেল আপ হবে
-            scale = 1.0 + 0.15 * (t / clip.duration)
-        elif motion == "zoom-out":
-            # 1.15 থেকে 1.0 পর্যন্ত স্কেল ডাউন হবে
-            scale = 1.15 - 0.15 * (t / clip.duration)
-        else:
-            return get_frame(t) # static
+        if motion_type == "zoom-in": scale = 1.0 + 0.15 * progress
+        elif motion_type == "zoom-out": scale = 1.15 - 0.15 * progress
 
         new_w, new_h = int(w * scale), int(h * scale)
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         
-        # ফ্রেমটিকে সেন্টারে ক্রপ করা
-        left = (new_w - w) / 2
-        top = (new_h - h) / 2
-        img = img.crop((left, top, left + w, top + h))
+        center_x, center_y = (new_w - w) / 2, (new_h - h) / 2
+        pan_x, pan_y = center_x, center_y
+
+        if motion_type == "pan-right": pan_x = (new_w - w) * progress
+        elif motion_type == "pan-left": pan_x = (new_w - w) * (1 - progress)
+        elif motion_type == "pan-down": pan_y = (new_h - h) * progress
+        elif motion_type == "pan-up": pan_y = (new_h - h) * (1 - progress)
+
+        img = img.crop((pan_x, pan_y, pan_x + w, pan_y + h))
         return np.array(img)
+    return clip.fl(effect)
 
-    if motion in ["zoom-in", "zoom-out"]:
-        return clip.fl(effect)
-    return clip
-
-def create_video():
-    # GitHub Action থেকে JSON ডাটা রিড করা
+def build_video():
     with open("input.json", "r") as f:
         data = json.load(f)
 
-    video_clips = []
-
-    for scene in data["scenes"]:
-        # ১. ইমেজ জেনারেট করা
-        img_path = generate_image(scene["bg_prompt"], scene["scene_n"])
-        
-        # ২. ImageClip তৈরি ও Duration সেট করা
-        clip = ImageClip(img_path).set_duration(scene["duration"])
-        
-        # ৩. Motion অ্যাপ্লাই করা
-        clip = apply_motion(clip, scene["motion"])
-        
-        # ৪. Transition অ্যাপ্লাই করা
-        if scene["transition"] == "fade-in":
-            clip = clip.fadein(1.0)
-        elif scene["transition"] == "fade-out":
-            clip = clip.fadeout(1.0)
-            
-        video_clips.append(clip)
-
-    # ৫. সবগুলো সিন একসাথে জোড়া লাগানো
-    print("Concatenating clips...")
-    final_video = concatenate_videoclips(video_clips, method="compose")
+    target_ratio = data["global_settings"].get("ratio", "16:9")
+    W, H = DIMENSIONS[target_ratio]
     
-    # ৬. ফাইনাল ভিডিও রেন্ডার করা
-    print("Rendering final video...")
-    final_video.write_videofile("output.mp4", fps=24, codec="libx264")
-    print("Video generation complete!")
+    clips = []
+    current_time = 0
+    overlap = 2.0 # ট্রানজিশন ডিউরেশন ২ সেকেন্ড
+
+    for idx, scene in enumerate(data["scenes"]):
+        img_path = generate_image(scene["bg_prompt"], target_ratio, scene["scene_n"])
+        base_clip = ImageClip(img_path).set_duration(scene["duration"]).resize((W, H))
+        clip = apply_motion(base_clip, scene["motion"])
+        
+        if idx == 0:
+            clip = clip.set_start(current_time)
+            clips.append(clip)
+            current_time += clip.duration
+        else:
+            prev_scene = data["scenes"][idx-1]
+            trans_file = prev_scene.get("transition_file", "none")
+            trans_type = prev_scene.get("transition_type", 1)
+            trans_path = f"assets/{trans_file}"
+            
+            if trans_file != "none" and os.path.exists(trans_path):
+                trans_video = VideoFileClip(trans_path).resize((W, H))
+                trans_dur = min(overlap, trans_video.duration)
+                
+                if trans_type == 1:
+                    # TYPE 1: Luma Masking (First image in white, Second image in black)
+                    start_time = current_time - trans_dur
+                    clip = clip.set_start(start_time)
+                    
+                    # Creating Mask for the 2nd Image
+                    def make_mask_type1(t, get_t_frame=trans_video.get_frame, tdur=trans_dur, w=W, h=H):
+                        if t < tdur:
+                            frame = get_t_frame(t)
+                            gray = frame[:, :, 0] / 255.0 # সাদা = 1, কালো = 0
+                            return 1.0 - gray # ইনভার্ট: কালো কালির জায়গায় ২য় ছবি দৃশ্যমান হবে
+                        return np.ones((h, w)) # ট্রানজিশন শেষে পুরোপুরি ২য় ছবি
+                        
+                    custom_mask = VideoClip(ismask=True, make_frame=make_mask_type1).set_duration(clip.duration)
+                    clip = clip.set_mask(custom_mask)
+                    clips.append(clip)
+                    current_time = start_time + clip.duration
+                    
+                elif trans_type == 2:
+                    # TYPE 2: First image gets covered in Black ink, then Second image fades in
+                    # Step A: আগের ছবির শেষের দিকে একটি কালো লেয়ার মাস্ক করে বসানো
+                    black_start = current_time - trans_dur
+                    black_clip = ColorClip(size=(W, H), color=(0,0,0)).set_duration(trans_dur).set_start(black_start)
+                    
+                    def make_mask_type2(t, get_t_frame=trans_video.get_frame, tdur=trans_dur, w=W, h=H):
+                        if t < tdur:
+                            frame = get_t_frame(t)
+                            gray = frame[:, :, 0] / 255.0
+                            return 1.0 - gray # কালির জায়গায় কালো রঙ বসবে
+                        return np.ones((h, w))
+                        
+                    black_mask = VideoClip(ismask=True, make_frame=make_mask_type2).set_duration(trans_dur)
+                    black_clip = black_clip.set_mask(black_mask)
+                    clips.append(black_clip)
+                    
+                    # Step B: স্ক্রিন পুরোপুরি কালো হওয়ার পর ২য় ছবির Fade-in
+                    clip = clip.set_start(current_time).fadein(1.0)
+                    clips.append(clip)
+                    current_time += clip.duration
+            else:
+                # Default cut
+                clip = clip.set_start(current_time)
+                clips.append(clip)
+                current_time += clip.duration
+
+    print("Compositing all layers. This will look awesome...")
+    final_video = CompositeVideoClip(clips, size=(W, H))
+    
+    final_video.write_videofile(
+        "ultimate_ink_video.mp4", 
+        fps=30, 
+        codec="libx264",
+        audio_codec="aac",
+        preset="ultrafast",
+        threads=4
+    )
+    print("Video generation successfully completed!")
 
 if __name__ == "__main__":
-    create_video()
+    build_video()
