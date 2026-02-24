@@ -1,3 +1,4 @@
+import sys
 import json
 import os
 import requests
@@ -29,7 +30,7 @@ def generate_image(prompt, size_ratio, scene_n):
     else:
         raise Exception(f"API Error: {response.text}")
 
-# Simple Universal Motion Engine
+# Universal Motion Engine
 def apply_motion(clip, motion_type):
     w, h = clip.size
     def effect(get_frame, t):
@@ -56,20 +57,34 @@ def apply_motion(clip, motion_type):
     return clip.fl(effect)
 
 def build_video():
-    with open("input.json", "r") as f:
-        data = json.load(f)
+    # 1. Error Handling for JSON Input
+    try:
+        with open("input.json", "r", encoding="utf-8") as f:
+            content = f.read()
+            if not content.strip():
+                print("Error: input.json is empty! Please check GitHub Actions input.")
+                sys.exit(1)
+            data = json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON Format! Details: {e}")
+        print(f"File content was:\n{content}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected Error while reading JSON: {e}")
+        sys.exit(1)
 
-    target_ratio = data["global_settings"].get("ratio", "16:9")
-    W, H = DIMENSIONS[target_ratio]
+    target_ratio = data.get("global_settings", {}).get("ratio", "16:9")
+    W, H = DIMENSIONS.get(target_ratio, (1920, 1080))
     
     clips = []
     current_time = 0
-    overlap = 2.0 # ট্রানজিশন ডিউরেশন ২ সেকেন্ড
+    overlap = 2.0 # Transition duration 2 seconds
 
-    for idx, scene in enumerate(data["scenes"]):
+    # 2. Process Scenes
+    for idx, scene in enumerate(data.get("scenes", [])):
         img_path = generate_image(scene["bg_prompt"], target_ratio, scene["scene_n"])
         base_clip = ImageClip(img_path).set_duration(scene["duration"]).resize((W, H))
-        clip = apply_motion(base_clip, scene["motion"])
+        clip = apply_motion(base_clip, scene.get("motion", "static"))
         
         if idx == 0:
             clip = clip.set_start(current_time)
@@ -86,17 +101,16 @@ def build_video():
                 trans_dur = min(overlap, trans_video.duration)
                 
                 if trans_type == 1:
-                    # TYPE 1: Luma Masking (First image in white, Second image in black)
+                    # TYPE 1 Logic: 2nd Image appears in the Black Ink area of transition
                     start_time = current_time - trans_dur
                     clip = clip.set_start(start_time)
                     
-                    # Creating Mask for the 2nd Image
                     def make_mask_type1(t, get_t_frame=trans_video.get_frame, tdur=trans_dur, w=W, h=H):
                         if t < tdur:
                             frame = get_t_frame(t)
-                            gray = frame[:, :, 0] / 255.0 # সাদা = 1, কালো = 0
-                            return 1.0 - gray # ইনভার্ট: কালো কালির জায়গায় ২য় ছবি দৃশ্যমান হবে
-                        return np.ones((h, w)) # ট্রানজিশন শেষে পুরোপুরি ২য় ছবি
+                            gray = frame[:, :, 0] / 255.0
+                            return 1.0 - gray # Invert: Shows 2nd clip where transition is Black
+                        return np.ones((h, w))
                         
                     custom_mask = VideoClip(ismask=True, make_frame=make_mask_type1).set_duration(clip.duration)
                     clip = clip.set_mask(custom_mask)
@@ -104,8 +118,7 @@ def build_video():
                     current_time = start_time + clip.duration
                     
                 elif trans_type == 2:
-                    # TYPE 2: First image gets covered in Black ink, then Second image fades in
-                    # Step A: আগের ছবির শেষের দিকে একটি কালো লেয়ার মাস্ক করে বসানো
+                    # TYPE 2 Logic: Screen covered in Black Ink -> Fade in 2nd image
                     black_start = current_time - trans_dur
                     black_clip = ColorClip(size=(W, H), color=(0,0,0)).set_duration(trans_dur).set_start(black_start)
                     
@@ -113,35 +126,35 @@ def build_video():
                         if t < tdur:
                             frame = get_t_frame(t)
                             gray = frame[:, :, 0] / 255.0
-                            return 1.0 - gray # কালির জায়গায় কালো রঙ বসবে
+                            return 1.0 - gray # Invert to apply black color over ink
                         return np.ones((h, w))
                         
                     black_mask = VideoClip(ismask=True, make_frame=make_mask_type2).set_duration(trans_dur)
                     black_clip = black_clip.set_mask(black_mask)
                     clips.append(black_clip)
                     
-                    # Step B: স্ক্রিন পুরোপুরি কালো হওয়ার পর ২য় ছবির Fade-in
                     clip = clip.set_start(current_time).fadein(1.0)
                     clips.append(clip)
                     current_time += clip.duration
             else:
-                # Default cut
+                # No valid transition file found -> Simple Cut
                 clip = clip.set_start(current_time)
                 clips.append(clip)
                 current_time += clip.duration
 
-    print("Compositing all layers. This will look awesome...")
+    print("Compositing all layers. Rendering the masterpiece...")
     final_video = CompositeVideoClip(clips, size=(W, H))
     
+    # 3. Final Output
     final_video.write_videofile(
-        "ultimate_ink_video.mp4", 
+        "final_video.mp4", 
         fps=30, 
         codec="libx264",
         audio_codec="aac",
         preset="ultrafast",
         threads=4
     )
-    print("Video generation successfully completed!")
+    print("Success! Video generation completed.")
 
 if __name__ == "__main__":
     build_video()
