@@ -29,7 +29,7 @@ def generate_image(prompt, size_ratio, scene_n):
     else:
         raise Exception(f"API Error: {response.text}")
 
-# Universal Motion Engine (No Black Borders)
+# Universal Motion Engine (Continuous Smooth Motion)
 def apply_motion(clip, motion_type):
     w, h = clip.size
     def effect(get_frame, t):
@@ -55,46 +55,6 @@ def apply_motion(clip, motion_type):
         return np.array(img)
     return clip.fl(effect)
 
-# ==========================================
-# ADVANCED TRANSITION ENGINES (BUG FREE)
-# ==========================================
-
-def apply_type1_transition(base_clip, trans_path, overlap, W, H):
-    """ TYPE 1: White = Prev Scene, Black = New Scene """
-    trans_video = VideoFileClip(trans_path).resize((W, H))
-    orig_dur = trans_video.duration
-    time_mult = orig_dur / overlap # Time mapping to avoid speedx glitch
-
-    def mask_frame(t):
-        if t < overlap:
-            orig_t = min(t * time_mult, orig_dur - 0.01) # Safety boundary
-            frame = trans_video.get_frame(orig_t)
-            gray = frame[:, :, 0] / 255.0
-            return np.clip(1.0 - gray, 0.0, 1.0)
-        return np.ones((H, W), dtype=float)
-
-    mask_clip = VideoClip(ismask=True, make_frame=mask_frame).set_duration(base_clip.duration)
-    return base_clip.set_mask(mask_clip)
-
-def create_type2_black_overlay(trans_path, start_time, overlap, fade_in_time, W, H):
-    """ TYPE 2: Ink paints screen black -> Prevents scene repeat glitch """
-    trans_video = VideoFileClip(trans_path).resize((W, H))
-    orig_dur = trans_video.duration
-    time_mult = orig_dur / overlap
-
-    def mask_frame(t):
-        if t < overlap:
-            orig_t = min(t * time_mult, orig_dur - 0.01)
-            frame = trans_video.get_frame(orig_t)
-            gray = frame[:, :, 0] / 255.0
-            return np.clip(1.0 - gray, 0.0, 1.0)
-        return np.ones((H, W), dtype=float)
-
-    # Black layer stays active slightly longer to cover the fade-in of the next scene
-    black_clip = ColorClip(size=(W, H), color=(0,0,0)).set_duration(overlap + fade_in_time)
-    mask_clip = VideoClip(ismask=True, make_frame=mask_frame).set_duration(overlap + fade_in_time)
-    return black_clip.set_mask(mask_clip).set_start(start_time)
-
 
 def build_video():
     try:
@@ -111,55 +71,83 @@ def build_video():
     target_ratio = data.get("global_settings", {}).get("ratio", "16:9")
     W, H = DIMENSIONS.get(target_ratio, (1920, 1080))
     
-    clips =[]
-    current_time = 0
-    overlap = 2.0
-    fade_in_time = 1.0
+    video_clips =[]
+    current_time = 0.0
+    overlap = 2.0  # 2 Seconds Transition Time
 
-    for idx, scene in enumerate(data.get("scenes",[])):
+    scenes = data.get("scenes",[])
+    
+    for idx, scene in enumerate(scenes):
+        is_last_scene = (idx == len(scenes) - 1)
+        base_duration = float(scene.get("duration", 5.0))
+        
+        # আপনার লজিক অনুযায়ী: Clip 1-এর টোটাল ডিউরেশন হবে base_duration + overlap/2
+        # যাতে ট্রানজিশন চলাকালীন ক্লিপটি ব্যাকগ্রাউন্ডে উপস্থিত থাকে
+        if not is_last_scene:
+            total_clip_duration = base_duration + (overlap / 2)
+        else:
+            total_clip_duration = base_duration
+            
+        # ইমেজ জেনারেট এবং মোশন অ্যাপ্লাই (মোশন পুরো সময় জুড়ে চলবে, তাই কোনো অ্যানিমেশন জাম্প হবে না)
         img_path = generate_image(scene["bg_prompt"], target_ratio, scene["scene_n"])
-        base_clip = ImageClip(img_path).set_duration(scene["duration"]).resize((W, H))
+        base_clip = ImageClip(img_path).set_duration(total_clip_duration).resize((W, H))
         clip = apply_motion(base_clip, scene.get("motion", "static"))
         
-        if idx == 0:
-            clip = clip.set_start(current_time)
-            clips.append(clip)
-            current_time += clip.duration
-        else:
-            prev_scene = data["scenes"][idx-1]
-            trans_file = prev_scene.get("transition_file", "none")
-            trans_type = prev_scene.get("transition_type", 1)
+        # ক্লিপটি টাইমলাইনের current_time এ বসানো হলো
+        clip = clip.set_start(current_time)
+
+        if not is_last_scene:
+            trans_file = scene.get("transition_file", "none")
             trans_path = f"assets/{trans_file}"
             
             if trans_file != "none" and os.path.exists(trans_path):
-                print(f"Applying Transition -> {trans_file} (Type: {trans_type})")
+                print(f"Applying Luma Matte Transition -> {trans_file}")
                 
-                if trans_type == 1:
-                    start_time = current_time - overlap
-                    clip = clip.set_start(start_time)
-                    clip = apply_type1_transition(clip, trans_path, overlap, W, H)
-                    clips.append(clip)
-                    current_time = start_time + clip.duration
+                # 1. Load MP4 mathematically to avoid speedx FFMPEG bugs
+                trans_video = VideoFileClip(trans_path).resize((W, H))
+                trans_orig_dur = trans_video.duration
+                time_mult = trans_orig_dur / overlap  # 5s -> 2s (Multiplier = 2.5)
+                
+                def make_luma_mask(t, t_vid=trans_video, t_mult=time_mult, t_dur=trans_orig_dur, c_dur=total_clip_duration, over=overlap, w=W, h=H):
+                    # ট্রানজিশন শুরু হওয়ার আগে মাস্ক পুরোপুরি সাদা (1.0) থাকবে, ফলে 1st Image পুরোপুরি দেখা যাবে
+                    if t < (c_dur - over):
+                        return np.ones((h, w), dtype=float)
                     
-                elif trans_type == 2:
-                    # 1. Background turns to black using ink
-                    black_start = current_time - overlap
-                    black_overlay = create_type2_black_overlay(trans_path, black_start, overlap, fade_in_time, W, H)
-                    clips.append(black_overlay)
-                    
-                    # 2. Smoothly fade in the new scene on top of the black ink
-                    clip = clip.set_start(current_time).fadein(fade_in_time)
-                    clips.append(clip)
-                    current_time += clip.duration
+                    # ট্রানজিশন শুরু হলে (শেষের ২ সেকেন্ডে)
+                    elif t <= c_dur:
+                        trans_t = (t - (c_dur - over)) * t_mult
+                        trans_t = min(trans_t, t_dur - 0.01) # Safety bound
+                        try:
+                            frame = t_vid.get_frame(trans_t)
+                        except:
+                            frame = t_vid.get_frame(t_dur - 0.01)
+                            
+                        # সাদা = 1 (1st Image), কালো = 0 (2nd Image), গ্রে = Smooth Blend
+                        gray = frame[:, :, 0] / 255.0
+                        return np.clip(gray, 0.0, 1.0)
+                        
+                    return np.zeros((h, w), dtype=float)
+
+                mask_clip = VideoClip(ismask=True, make_frame=make_luma_mask).set_duration(total_clip_duration)
+                clip = clip.set_mask(mask_clip)
+                
             else:
                 if trans_file != "none":
-                    print(f"❌ WARNING: File '{trans_file}' not found! Applying cut.")
-                clip = clip.set_start(current_time)
-                clips.append(clip)
-                current_time += clip.duration
+                    print(f"❌ WARNING: File '{trans_file}' not found! Applying hard cut.")
+                    
+            # 2nd Image এর Start Time (1st Image এর base duration এর মাঝে overlap/2 বিয়োগ করে)
+            current_time += base_duration - (overlap / 2)
+            
+        video_clips.append(clip)
 
-    print("Compositing all layers. Rendering the masterpiece...")
-    final_video = CompositeVideoClip(clips, size=(W, H))
+    print("Compositing all layers. Reversing Z-Index for Professional Luma Matte...")
+    
+    # সবচেয়ে গুরুত্বপূর্ণ ফিক্স: 
+    # Clip 1 কে উপরে রাখতে হবে, Clip 2 কে নিচে। তাই লিস্টটাকে উল্টে (Reverse) দেওয়া হলো।
+    # এর ফলে 1st Image এর কালো মাস্কের ভেতর দিয়ে নিচের 2nd Image ঠিকমতো দেখা যাবে।
+    reversed_clips = video_clips[::-1]
+    
+    final_video = CompositeVideoClip(reversed_clips, size=(W, H))
     
     final_video.write_videofile(
         "final_video.mp4", 
@@ -169,7 +157,7 @@ def build_video():
         preset="ultrafast",
         threads=4
     )
-    print("Success! Perfect Video generation completed.")
+    print("Success! Perfect Professional Video generation completed without a single glitch.")
 
 if __name__ == "__main__":
     build_video()
