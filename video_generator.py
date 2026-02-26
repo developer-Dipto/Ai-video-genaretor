@@ -6,6 +6,7 @@ import numpy as np
 import random
 from PIL import Image
 from moviepy.editor import *
+import moviepy.video.fx.all as vfx # ফাস্ট-ফরোয়ার্ড করার জন্য
 
 # API Config
 API_URL = "https://simple-ai-image-genaretor.deptoroy91.workers.dev/"
@@ -57,30 +58,24 @@ def apply_motion(clip, motion_type):
     return clip.fl(effect)
 
 def build_video():
-    # 1. Error Handling for JSON Input
     try:
         with open("input.json", "r", encoding="utf-8") as f:
             content = f.read()
             if not content.strip():
-                print("Error: input.json is empty! Please check GitHub Actions input.")
+                print("Error: input.json is empty!")
                 sys.exit(1)
             data = json.loads(content)
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON Format! Details: {e}")
-        print(f"File content was:\n{content}")
-        sys.exit(1)
     except Exception as e:
-        print(f"Unexpected Error while reading JSON: {e}")
+        print(f"JSON Error: {e}")
         sys.exit(1)
 
     target_ratio = data.get("global_settings", {}).get("ratio", "16:9")
     W, H = DIMENSIONS.get(target_ratio, (1920, 1080))
     
-    clips = []
+    clips =[]
     current_time = 0
-    overlap = 2.0 # Transition duration 2 seconds
+    overlap = 2.0 # ২ সেকেন্ডের ট্রানজিশন
 
-    # 2. Process Scenes
     for idx, scene in enumerate(data.get("scenes", [])):
         img_path = generate_image(scene["bg_prompt"], target_ratio, scene["scene_n"])
         base_clip = ImageClip(img_path).set_duration(scene["duration"]).resize((W, H))
@@ -96,48 +91,62 @@ def build_video():
             trans_type = prev_scene.get("transition_type", 1)
             trans_path = f"assets/{trans_file}"
             
-            if trans_file != "none" and os.path.exists(trans_path):
-                trans_video = VideoFileClip(trans_path).resize((W, H))
-                trans_dur = min(overlap, trans_video.duration)
-                
-                if trans_type == 1:
-                    # TYPE 1 Logic: 2nd Image appears in the Black Ink area of transition
-                    start_time = current_time - trans_dur
-                    clip = clip.set_start(start_time)
+            if trans_file != "none":
+                if os.path.exists(trans_path):
+                    print(f"Applying Transition -> {trans_file} (Type: {trans_type})")
+                    # FIX 1: ট্রানজিশন ভিডিওকে ফাস্ট করে ওভারল্যাপের সমান (২ সেকেন্ড) করা হলো
+                    trans_video = VideoFileClip(trans_path).resize((W, H))
+                    trans_video = trans_video.fx(vfx.speedx, final_duration=overlap)
+                    trans_dur = overlap
                     
-                    def make_mask_type1(t, get_t_frame=trans_video.get_frame, tdur=trans_dur, w=W, h=H):
-                        if t < tdur:
-                            frame = get_t_frame(t)
-                            gray = frame[:, :, 0] / 255.0
-                            return 1.0 - gray # Invert: Shows 2nd clip where transition is Black
-                        return np.ones((h, w))
+                    if trans_type == 1:
+                        # TYPE 1: White = 1st Image, Black = 2nd Image
+                        start_time = current_time - trans_dur
+                        clip = clip.set_start(start_time)
                         
-                    custom_mask = VideoClip(ismask=True, make_frame=make_mask_type1).set_duration(clip.duration)
-                    clip = clip.set_mask(custom_mask)
-                    clips.append(clip)
-                    current_time = start_time + clip.duration
-                    
-                elif trans_type == 2:
-                    # TYPE 2 Logic: Screen covered in Black Ink -> Fade in 2nd image
-                    black_start = current_time - trans_dur
-                    black_clip = ColorClip(size=(W, H), color=(0,0,0)).set_duration(trans_dur).set_start(black_start)
-                    
-                    def make_mask_type2(t, get_t_frame=trans_video.get_frame, tdur=trans_dur, w=W, h=H):
-                        if t < tdur:
-                            frame = get_t_frame(t)
-                            gray = frame[:, :, 0] / 255.0
-                            return 1.0 - gray # Invert to apply black color over ink
-                        return np.ones((h, w))
+                        def make_mask_type1(t, get_t_frame=trans_video.get_frame, tdur=trans_dur, w=W, h=H):
+                            if t < tdur:
+                                try: frame = get_t_frame(t)
+                                except: frame = get_t_frame(tdur - 0.01) # ফ্রেম ড্রপ ঠেকানোর সেফটি
+                                gray = frame[:, :, 0] / 255.0
+                                return np.clip(1.0 - gray, 0.0, 1.0)
+                            return np.ones((h, w), dtype=float)
+                            
+                        custom_mask = VideoClip(ismask=True, make_frame=make_mask_type1).set_duration(clip.duration)
+                        clip = clip.set_mask(custom_mask)
+                        clips.append(clip)
+                        current_time = start_time + clip.duration
                         
-                    black_mask = VideoClip(ismask=True, make_frame=make_mask_type2).set_duration(trans_dur)
-                    black_clip = black_clip.set_mask(black_mask)
-                    clips.append(black_clip)
-                    
-                    clip = clip.set_start(current_time).fadein(1.0)
+                    elif trans_type == 2:
+                        # TYPE 2: Full screen black ink -> Then Fade in 2nd image
+                        black_start = current_time - trans_dur
+                        fade_in_time = 1.0
+                        
+                        # FIX 2: Black background কে fade_in_time পর্যন্ত লম্বা করা হলো যাতে গ্লিচ না হয়
+                        black_clip = ColorClip(size=(W, H), color=(0,0,0)).set_duration(trans_dur + fade_in_time).set_start(black_start)
+                        
+                        def make_mask_type2(t, get_t_frame=trans_video.get_frame, tdur=trans_dur, w=W, h=H):
+                            if t < tdur:
+                                try: frame = get_t_frame(t)
+                                except: frame = get_t_frame(tdur - 0.01)
+                                gray = frame[:, :, 0] / 255.0
+                                return np.clip(1.0 - gray, 0.0, 1.0)
+                            return np.ones((h, w), dtype=float)
+                            
+                        black_mask = VideoClip(ismask=True, make_frame=make_mask_type2).set_duration(trans_dur + fade_in_time)
+                        black_clip = black_clip.set_mask(black_mask)
+                        clips.append(black_clip)
+                        
+                        clip = clip.set_start(current_time).fadein(fade_in_time)
+                        clips.append(clip)
+                        current_time += clip.duration
+                else:
+                    # FIX 3: ফাইল না পেলে লাল রঙের ওয়ার্নিং দেবে যাতে আপনি বুঝতে পারেন নাম ভুল হয়েছে
+                    print(f"\n❌ WARNING: File '{trans_file}' not found in assets/ folder! Check spelling! Applying normal cut instead.\n")
+                    clip = clip.set_start(current_time)
                     clips.append(clip)
                     current_time += clip.duration
             else:
-                # No valid transition file found -> Simple Cut
                 clip = clip.set_start(current_time)
                 clips.append(clip)
                 current_time += clip.duration
@@ -145,7 +154,6 @@ def build_video():
     print("Compositing all layers. Rendering the masterpiece...")
     final_video = CompositeVideoClip(clips, size=(W, H))
     
-    # 3. Final Output
     final_video.write_videofile(
         "final_video.mp4", 
         fps=30, 
@@ -154,7 +162,7 @@ def build_video():
         preset="ultrafast",
         threads=4
     )
-    print("Success! Video generation completed.")
+    print("Success! Bug-Free Video generation completed.")
 
 if __name__ == "__main__":
     build_video()
